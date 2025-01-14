@@ -25,7 +25,11 @@ function Blob{T}(blob::Blob) where T
 end
 
 function assert_same_allocation(blob1::Blob, blob2::Blob)
-    @assert getfield(blob1, :base) == getfield(blob2, :base) "These blobs do not share the same allocation: $blob1 - $blob2"
+    @noinline _throw(blob1, blob2) =
+        throw(AssertionError("These blobs do not share the same allocation: $blob1 - $blob2"))
+    if getfield(blob1, :base) != getfield(blob2, :base)
+        _throw(blob1, blob2)
+    end
 end
 
 function Base.pointer(blob::Blob{T}) where T
@@ -63,36 +67,61 @@ The number of bytes needed to allocate `T` itself.
 
 Defaults to `sizeof(T)`.
 """
-@generated function self_size(::Type{T}) where T
-    @assert isconcretetype(T)
+Base.@assume_effects :foldable function self_size(::Type{T}) where T
+    # This function is marked :foldable to encourage constant folding for this types-only
+    # static computation.
     if isempty(fieldnames(T))
-        quote
-            $(Expr(:meta, :inline))
-            $(sizeof(T))
-        end
+        sizeof(T)
     else
-        quote
-            $(Expr(:meta, :inline))
-            $(+(0, @splice i in 1:length(fieldnames(T)) begin
-                self_size(fieldtype(T, i))
-            end))
+        # Recursion is the fastest way to compile this, confirmed with benchmarks.
+        # Alternatives considered:
+        # - +(Iterators.map(self_size, fieldtypes(T))...)
+        # - runtime_size for-loop (below).
+        # Splatting is always slower, and breaks after ~30 fields.
+        # The for-loop is faster after around 15-30 fields, so we pick an
+        # arbitrary cutoff of 20:
+        if fieldcount(T) > 20
+            _iterative_sum_field_sizes(T)
+        else
+            _recursive_sum_field_sizes(T)
         end
     end
 end
-
-function blob_offset(::Type{T}, i::Int) where {T}
-    +(0, @splice j in 1:(i-1) begin
-        self_size(fieldtype(T, j))
-    end)
+function _iterative_sum_field_sizes(::Type{T}) where T
+    out = 0
+    for f in fieldtypes(T)
+        out += Blobs.self_size(f)
+    end
+    out
+end
+Base.@assume_effects :foldable _recursive_sum_field_sizes(::Type{T}) where {T} =
+    _recursive_sum_field_sizes(T, Val(fieldcount(T)))
+Base.@assume_effects :foldable _recursive_sum_field_sizes(::Type, ::Val{0}) = 0
+Base.@assume_effects :foldable function _recursive_sum_field_sizes(::Type{T}, ::Val{i}) where {T,i}
+    return self_size(fieldtype(T, i)) + _recursive_sum_field_sizes(T, Val(i-1))
 end
 
-@generated function Base.getindex(blob::Blob{T}, ::Type{Val{field}}) where {T, field}
-    i = findfirst(isequal(field), fieldnames(T))
-    @assert i != nothing "$T has no field $field"
-    quote
-        $(Expr(:meta, :inline))
-        Blob{$(fieldtype(T, i))}(blob + $(blob_offset(T, i)))
-    end
+# Recursion scales better than splatting for large numbers of fields.
+Base.@assume_effects :foldable @inline function blob_offset(::Type{T}, i::Int) where {T}
+    _recursive_sum_field_sizes(T, Val(i - 1))
+end
+
+# Manually write a compile-time loop in the type domain, to enforce constant-folding the
+# fieldidx even for large structs (with e.g. 100 fields). This might make compiling a touch
+# slower, but it allows this to work for even large structs, like the manually-written
+# `@generated` functions did before.
+@inline function fieldidx(::Type{T}, ::Val{field}) where {T,field}
+    return _fieldidx_lookup(T, Val(field), Val(fieldcount(T)))
+end
+_fieldidx_lookup(::Type{T}, ::Val{field}, ::Val{0}) where {T,field} =
+    error("$T has no field $field")
+_fieldidx_lookup(::Type{T}, ::Val{field}, ::Val{i}) where {T,i,field} =
+    fieldname(T, i) === field ? i : _fieldidx_lookup(T, Val(field), Val(i-1))
+
+@inline function Base.getindex(blob::Blob{T}, field::Symbol) where {T}
+    i = fieldidx(T, Val(field))
+    FT = fieldtype(T, i)
+    Blob{FT}(blob + blob_offset(T, i))
 end
 
 @inline function Base.getindex(blob::Blob{T}, i::Int) where {T}
@@ -112,46 +141,60 @@ Base.@propagate_inbounds function Base.setindex!(blob::Blob{T}, value) where T
     setindex!(blob, convert(T, value))
 end
 
-@generated function Base.unsafe_load(blob::Blob{T}) where {T}
+macro _make_new(type, args)
+    # :splatnew lets you directly invoke the type's inner constructor with a Tuple,
+    # bypassing any effects from any custom constructors.
+    return Expr(:splatnew, esc(type), esc(args))
+end
+@inline function Base.unsafe_load(blob::Blob{T}) where {T}
     if isempty(fieldnames(T))
-        quote
-            $(Expr(:meta, :inline))
-            unsafe_load(pointer(blob))
-        end
+        unsafe_load(pointer(blob))
     else
-        quote
-            $(Expr(:meta, :inline))
-            $(Expr(:new, T, @splice (i, field) in enumerate(fieldnames(T)) quote
-                unsafe_load(getindex(blob, $(Val{field})))
-            end))
-        end
+        # This recursive definition is *almost* as fast as the `@generated` code. On julia
+        # 1.10, it has a single invoke function call here, which adds a few ns overhead.
+        # But on julia 1.11, this generates the expected code and is just as fast.
+        # We are sticking with this version though, to save the `@generated` compilation time.
+        @_make_new(T, _unsafe_load_fields(blob, Val(fieldcount(T))))
     end
 end
+@inline _unsafe_load_fields(::Blob, ::Val{0}) = ()
+function _unsafe_load_fields(blob::Blob{T}, ::Val{I}) where {T, I}
+    @inline
+    types = fieldnames(T)
+    return (_unsafe_load_fields(blob, Val(I-1))..., unsafe_load(getindex(blob, types[I])))
+end
 
-@generated function Base.unsafe_store!(blob::Blob{T}, value::T) where {T}
+@inline function Base.unsafe_store!(blob::Blob{T}, value::T) where {T}
     if isempty(fieldnames(T))
-        quote
-            $(Expr(:meta, :inline))
-            unsafe_store!(pointer(blob), value)
-            value
-        end
-    elseif T <: Tuple
-        quote
-            $(Expr(:meta, :inline))
-            $(@splice (i, field) in enumerate(fieldnames(T)) quote
-                unsafe_store!(getindex(blob, $(Val{field})), value[$field])
-            end)
-            value
-        end
+        unsafe_store!(pointer(blob), value)
+        value
     else
-        quote
-            $(Expr(:meta, :inline))
-            $(@splice (i, field) in enumerate(fieldnames(T)) quote
-                unsafe_store!(getindex(blob, $(Val{field})), value.$field)
-            end)
-            value
-        end
+        _unsafe_store_struct!(blob, value, Val(fieldcount(T)))
+        value
     end
+end
+# On julia 1.11, this is equivalantly fast to the `@generated` version.
+# On julia 1.10, this is about 2x slower than generated for medium structs: ~10 ns vs ~5 ns.
+# We will go with the recursive version, to avoid the compilation cost.
+@inline _unsafe_store_struct!(::Blob{T}, ::T, ::Val{0}) where {T} = nothing
+function _unsafe_store_struct!(blob::Blob{T}, value::T, ::Val{I}) where {T, I}
+    @inline
+    types = fieldnames(T)
+    _unsafe_store_struct!(blob, value, Val(I-1))
+    unsafe_store!(getindex(blob, types[I]), getproperty(value, types[I]))
+    nothing
+end
+# Recursive function for tuples is equivalent to unrolled via `@generated`.
+function Base.unsafe_store!(blob::Blob{T}, value::T) where {T <: Tuple}
+    _unsafe_store_tuple!(blob, value, Val(fieldcount(T)))
+    value
+end
+@inline _unsafe_store_tuple!(::Blob{T}, ::T, ::Val{0}) where {T<:Tuple} = nothing
+function _unsafe_store_tuple!(blob::Blob{T}, value::T, ::Val{I}) where {T<:Tuple, I}
+    @inline
+    _unsafe_store_struct!(blob, value, Val(I-1))
+    unsafe_store!(getindex(blob, I), value[I])
+    nothing
 end
 
 # if the value is the wrong type, try to convert it (just like setting a field normally)
@@ -166,11 +209,11 @@ function Base.propertynames(::Blob{T}, private::Bool=false) where T
 end
 
 function Base.getproperty(blob::Blob{T}, field::Symbol) where T
-    getindex(blob, Val{field})
+    getindex(blob, field)
 end
 
 function Base.setproperty!(blob::Blob{T}, field::Symbol, value) where T
-    setindex!(blob, Val{field}, value)
+    setindex!(blob, Val(field), value)
 end
 
 function rewrite_address(expr)
@@ -185,7 +228,7 @@ function rewrite_address(expr)
         else
             error("Impossible?")
         end
-        :(getindex($(rewrite_address(object)), $(Val{fieldname})))
+        :(getindex($(rewrite_address(object)), $(QuoteNode(fieldname))))
     elseif expr.head == :ref
         object = expr.args[1]
         :(getindex($(rewrite_address(object)), $(map(esc, expr.args[2:end])...)))
